@@ -16,10 +16,19 @@
 //Parmetis 2.0
 //#include "parmetis.h"
 //Parmetis 3.1
-#include "parmetislib.h"
+#include <parmetis.h>
+
+typedef struct {
+  int nvtx;
+
+  int *vtxdist;
+  int *xadj;
+  int *vwgt;
+  int *adjncy;
+} graph_t;
 
 // Private function
-static void GetGraph(GraphType *graph, gridT *grid, MPI_Comm comm);
+static void GetDistributedGraph(graph_t *graph, gridT *grid, MPI_Comm comm);
 
 /*
  * Function: GetPartitioning
@@ -30,152 +39,139 @@ static void GetGraph(GraphType *graph, gridT *grid, MPI_Comm comm);
  *
  */
 void GetPartitioning(gridT *maingrid, gridT **localgrid, int myproc, int numprocs, MPI_Comm comm) {
-  int j, proc, numflag=0, wgtflag=0, options[5], edgecut;
-  GraphType graph;
+  int numflag=0, wgtflag=0, options[5], edgecut, ncon, *nvtxs;
+  float ub, *tpwgts;
+  graph_t graph;
   MPI_Status status;
 
-  if(numprocs>1) {
-    options[0] = 0;
-    wgtflag = 2;
-    numflag = 0;
-    
-    GetGraph(&graph,maingrid,comm);
-    
-    (*localgrid)->part = SunMalloc(graph.nvtxs*sizeof(int),"GetPartitioning");
-    
+  if (numprocs > 1) {
+    options[0] = 0; // no options
+    wgtflag = 2; // weights on vertices only
+    numflag = 0; // 0-indexing
+    ncon = 1; // number of weights per vertex
+    ub = 1.05f; // imbalance tolerance for weights
+
+    tpwgts = malloc(numprocs * sizeof(float));
+    for (int i = 0; i < numprocs; i++) {
+      tpwgts[i] = 1.0f / (float)numprocs;
+    }
+
+    // distribute the full grid over all processes
+    GetDistributedGraph(&graph, maingrid, comm);
+
+    (*localgrid)->part = SunMalloc(graph.nvtx*sizeof(int),"GetPartitioning");
+
     /*
      * Partition the graph and create the part array.
      */
-    if(myproc==0 && VERBOSE>2) printf("Partitioning with ParMETIS_PartKway...\n");
-    ParMETIS_PartKway(graph.vtxdist,graph.xadj,graph.adjncy,graph.vwgt,NULL,
-		      &wgtflag,&numflag,&numprocs,options,&edgecut,
-		      (*localgrid)->part,&comm);
-    
-    if(myproc==0 && VERBOSE>2) printf("Redistributing the partition arrays...\n");
-    if(myproc!=0) 
-      MPI_Send((void *)(*localgrid)->part,graph.nvtxs,MPI_INT,0,1,comm); 
-    else {
-      for(j=0;j<graph.nvtxs;j++)
-	maingrid->part[graph.vtxdist[myproc]+j]=(*localgrid)->part[j];
-      for(proc=1;proc<numprocs;proc++) 
-	MPI_Recv((void *)(maingrid->part+graph.vtxdist[proc]),
-		 graph.vtxdist[proc+1]-graph.vtxdist[proc],MPI_INT,proc,1,comm,&status);
-    }
-    MPI_Bcast((void *)maingrid->part,maingrid->Nc,MPI_INT,0,comm);
+    if (myproc == 0 && VERBOSE > 2) printf("Partitioning with ParMETIS_PartKway...\n");
 
-    SunFree((*localgrid)->part,graph.nvtxs*sizeof(int),"GetPartitioning");
+    ParMETIS_V3_PartKway(graph.vtxdist, graph.xadj, graph.adjncy, graph.vwgt, NULL,
+			 &wgtflag, &numflag, &ncon, &numprocs, tpwgts, &ub,
+			 options, &edgecut, (*localgrid)->part, &comm);
+
+    if(myproc == 0 && VERBOSE > 2) printf("Redistributing the partition arrays...\n");
+    nvtxs = malloc(numprocs * sizeof(int));
+    for (int i = 0; i < numprocs; i++) {
+      nvtxs[i] = graph.vtxdist[i + 1] - graph.vtxdist[i];
+    }
+
+    // let everybody know about the new distribution
+    MPI_Allgatherv((void *)(*localgrid)->part, graph.nvtx, MPI_INT,
+		maingrid->part, nvtxs, graph.vtxdist, MPI_INT, comm);
+
+    SunFree((*localgrid)->part, graph.nvtx*sizeof(int),"GetPartitioning");
+
+    free(tpwgts);
+    free(nvtxs);
+
+    free(graph.vtxdist);
+    free(graph.xadj);
+    free(graph.vwgt);
+    free(graph.adjncy);
   } else {
-    for(j=0;j<maingrid->Nc;j++)
-      maingrid->part[j]=0;
+    for(int j = 0; j < maingrid->Nc; j++)
+      maingrid->part[j] = 0;
   }
 }
 
-/*
- * Function: GetGraph
- * Usage GetGraph(graph,grid,comm);
- * --------------------------------
- * This code was adapted from the ParMetis-2.0 code in the ParMetis
- * distribution.
- *
- */
-static void GetGraph(GraphType *graph, gridT *grid, MPI_Comm comm)
+static void GetDistributedGraph(graph_t *graph, gridT *grid, MPI_Comm comm)
 {
-  int i, k, l, numprocs, myproc;
-  int nvtxs, penum, snvtxs;
-  idxtype *gxadj, *gadjncy, *gvwgt;  
-  idxtype *vtxdist, *sxadj, *ssize, *svwgt;
-  MPI_Status status;
+  int numprocs, rank;
+
+  // number of vertices distributed to each process (for scatter)
+  int *pvtx = NULL, *pvtxp1 = NULL;
+  // number of edges on each process, and their offset in the global adjncy
+  int *pedg = NULL, *edge_offsets = NULL;
 
   MPI_Comm_size(comm, &numprocs);
-  MPI_Comm_rank(comm, &myproc);
+  MPI_Comm_rank(comm, &rank);
 
-  vtxdist = graph->vtxdist = idxsmalloc(numprocs+1, 0, "ReadGraph: vtxdist");
+  // allocate array to hold vertex distribution
+  graph->vtxdist = malloc(sizeof(int) * (numprocs + 1));
 
-  if (myproc == 0) {
-    ssize = idxsmalloc(numprocs, 0, "ReadGraph: ssize");
+  // construct vertex distribution
+  if (rank == 0) {
+    pvtx = malloc(sizeof(int) * numprocs);
+    pvtxp1 = malloc(sizeof(int) * numprocs);
+    pedg = malloc(sizeof(int) * numprocs);
+    edge_offsets = malloc(sizeof(int) * numprocs);
 
-    nvtxs = grid->Nc;
-    gxadj = grid->xadj;
-    gadjncy = grid->adjncy;
-    gvwgt = (idxtype *)grid->vwgt;
+    graph->vtxdist[0] = 0;
+    edge_offsets[0] = 0;
 
-    /* Construct vtxdist and send it to all the processors */
-    vtxdist[0] = 0;
-    for (i=0,k=nvtxs; i<numprocs; i++) {
-      l = k/(numprocs-i);
-      vtxdist[i+1] = vtxdist[i]+l;
-      k -= l;
+    for (int i = 0, k = grid->Nc; i < numprocs; i++) {
+      pvtx[i] = k / (numprocs - i); // number of vertices for this processor
+      pvtxp1[i] = pvtx[i] + 1; // size of xadj for this processor
+
+      graph->vtxdist[i+1] = graph->vtxdist[i] + pvtx[i];
+
+      k -= pvtx[i];
     }
-  }
 
-  MPI_Bcast((void *)vtxdist, numprocs+1, IDX_DATATYPE, 0, comm);
+    for (int i = 0, k = 0; i < numprocs; i++) {
+      pedg[i] = grid->xadj[k + pvtx[i]] - grid->xadj[k];
+      k += pvtx[i];
 
-  graph->gnvtxs = vtxdist[numprocs];
-  graph->nvtxs = vtxdist[myproc+1]-vtxdist[myproc];
-  graph->xadj = idxmalloc(graph->nvtxs+1, "ReadGraph: xadj");
-  graph->vwgt = idxmalloc(graph->nvtxs, "ReadGraph: vwgt");
-
-  if (myproc == 0) {
-    for (penum=0; penum<numprocs; penum++) {
-      snvtxs = vtxdist[penum+1]-vtxdist[penum];
-      sxadj = idxmalloc(snvtxs+1, "ReadGraph: sxadj");
-      svwgt = idxmalloc(snvtxs, "ReadGraph: svwgt");
-
-      idxcopy(snvtxs+1, gxadj+vtxdist[penum], sxadj);
-      idxcopy(snvtxs, gvwgt+vtxdist[penum], svwgt);
-
-      if(VERBOSE>3) 
-	for(k=0;k<snvtxs;k++)
-	  printf("svwgt[%d]=%d\n",k,svwgt[k]);
-
-      for (i=snvtxs; i>=0; i--)
-        sxadj[i] -= sxadj[0];
-
-      ssize[penum] = gxadj[vtxdist[penum+1]] - gxadj[vtxdist[penum]];
-
-      if (penum == myproc) {
-        idxcopy(snvtxs+1, sxadj, graph->xadj);
-	idxcopy(snvtxs, svwgt, graph->vwgt);
-      } else {
-        MPI_Send((void *)sxadj, snvtxs+1, IDX_DATATYPE, penum, 1, comm); 
-        MPI_Send((void *)svwgt, snvtxs, IDX_DATATYPE, penum, 1, comm); 
+      if (i < numprocs - 1) {
+	edge_offsets[i+1] = edge_offsets[i] + pedg[i];
       }
-
-      free(sxadj);
-      free(svwgt);
     }
   }
-  else {
-    MPI_Recv((void *)graph->xadj, graph->nvtxs+1, IDX_DATATYPE, 0, 1, comm, &status);
-    MPI_Recv((void *)graph->vwgt, graph->nvtxs, IDX_DATATYPE, 0, 1, comm, &status);
+  MPI_Bcast((void *)graph->vtxdist, numprocs + 1, MPI_INT, 0, comm);
+
+  // number of local vertices
+  int nvtx = graph->vtxdist[rank + 1] - graph->vtxdist[rank];
+  graph->nvtx = nvtx;
+
+  // allocate adjacency list counts and vertex weights
+  graph->xadj = malloc(sizeof(int) * (nvtx + 1));
+  graph->vwgt = malloc(sizeof(int) * nvtx);
+
+  // send pvtx+1 elements of xadj to each processor
+  MPI_Scatterv(grid->xadj, pvtxp1, graph->vtxdist, MPI_INT,
+	       graph->xadj, nvtx + 1, MPI_INT, 0, comm);
+  // convert to local vertex numbering
+  for (int i = nvtx; i >= 0; i--) {
+    graph->xadj[i] -= graph->xadj[0];
   }
-  if(VERBOSE>3) {
-    printf("Weights on each processor after MPI_Recv\n");
-    for(k=0;k<graph->nvtxs;k++)
-      printf("vwgt[%d]=%d\n",k,graph->vwgt[k]);
+
+  // send pvtx elements of vwgt to each processor
+  MPI_Scatterv(grid->vwgt, pvtx, graph->vtxdist, MPI_INT,
+	       graph->vwgt, nvtx, MPI_INT, 0, comm);
+
+  // number of local edges
+  int nedg = graph->xadj[nvtx];
+  graph->adjncy = malloc(sizeof(int) * nedg);
+
+  // scatter adjncy to each processor
+  MPI_Scatterv(grid->adjncy, pedg, edge_offsets, MPI_INT,
+	       graph->adjncy, nedg, MPI_INT, 0, comm);
+
+  if (rank == 0) {
+    free(pvtx);
+    free(pvtxp1);
+    free(pedg);
+    free(edge_offsets);
   }
-
-  graph->nedges = graph->xadj[graph->nvtxs];
-  graph->adjncy = idxmalloc(graph->nedges, "ReadGraph: graph->adjncy");
-
-  if (myproc == 0) {
-    for (penum=0; penum<numprocs; penum++) {
-      if (penum == myproc) 
-        idxcopy(ssize[penum], gadjncy+gxadj[vtxdist[penum]], graph->adjncy);
-      else
-        MPI_Send((void *)(gadjncy+gxadj[vtxdist[penum]]), ssize[penum], IDX_DATATYPE, penum, 1, comm); 
-    }
-
-    free(ssize);
-  }
-  else 
-    MPI_Recv((void *)graph->adjncy, graph->nedges, IDX_DATATYPE, 0, 1, comm, &status);
-
-  if (myproc == 0) 
-    GKfree(&gxadj, &gadjncy, LTERM);
-
-  MALLOC_CHECK(NULL);
 }
-
-
-

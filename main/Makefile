@@ -14,7 +14,7 @@ include Makefile.in
 ifneq ($(MPIHOME),)
   # For the SGI Altix
   # CC = icc
-  CC = $(MPIHOME)/bin/mpicc
+  CC = mpicc
   MPIFILE = 
   MPIDEF = 
 else
@@ -45,9 +45,9 @@ else
 endif	
 
 ifneq ($(PARMETISHOME),)
-  PARMETISINCLUDE = -I$(PARMETISHOME)/ParMETISLib
-  PARMETISLIB = $(PARMETISHOME)/libparmetis.a $(PARMETISHOME)/libmetis.a
-  PARMETISLIBDIR = -L$(PARMETISHOME)
+  PARMETISINCLUDE = -I$(PARMETISHOME)/include
+  PARMETISLIB =
+  PARMETISLIBDIR = 
   PARMETISLD = -lparmetis -lmetis 
   PARMETISSRC = partition.c
 else
@@ -59,9 +59,9 @@ else
 endif
 
 ifneq ($(NETCDF4HOME),)
-  NETCDFLIBDIR=-L$(NETCDF4HOME)/lib
-  NETCDFINCLUDE=-I$(NETCDF4HOME)/include
-  NETCDFLD=-lnetcdf
+  NETCDFLIBDIR=
+  NETCDFINCLUDE=
+  NETCDFLD= -lnetcdf
   NETCDFDEF = -DUSENETCDF
   NETCDFSRC= mynetcdf.c
 else
@@ -75,7 +75,7 @@ endif
 # For the Altix
 #LD = $(CC) -lmpi
 LD = $(CC)
-LIBS = $(PARMETISLIB) $(TRIANGLELIB) $(NETCDFLD)
+LIBS = $(PARMETISLD) $(TRIANGLELIB) $(NETCDFLD)
 LIBDIR = $(PARMETISLIBDIR) $(TRIANGLELIBDIR) $(NETCDFLIBDIR)
 LDFLAGS = -lm $(LIBDIR) $(LIBS)
 INCLUDES = $(PARMETISINCLUDE) $(TRIANGLEINCLUDE) $(NETCDFINCLUDE) 
